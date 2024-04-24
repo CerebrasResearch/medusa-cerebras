@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+from collections import defaultdict
+
 
 TOPK=10 # topk for sparse tree (10 is a placeholder and it is sufficient)
 
@@ -149,6 +151,61 @@ def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values):
     model.base_model.model.medusa_mask = medusa_attn_mask
     return medusa_logits, logits
 
+# def initialize_hydra(input_ids, model, medusa_attn_mask, past_key_values, proposal_cross_attn_masks):
+#     """
+#     Initializes the Medusa structure for a given model.
+
+#     This function performs the following operations:
+#     1. Forward pass through the model to obtain the Medusa logits, original model outputs, and logits.
+#     2. Sets the Medusa attention mask within the base model.
+
+#     Args:
+#     - input_ids (torch.Tensor): The input tensor containing token ids.
+#     - model (MedusaLMHead): The model containing the Medusa layers and base model.
+#     - medusa_attn_mask (torch.Tensor): The attention mask designed specifically for the Medusa structure.
+#     - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+
+#     Returns:
+#     - medusa_logits (torch.Tensor): Logits from the Medusa heads.
+#     - logits (torch.Tensor): Original logits from the base model.
+#     """
+#     medusa_logits, hidden_states, outputs, logits, base_hidden_states = model(
+#         input_ids, past_key_values=past_key_values, output_orig=True, medusa_forward=True, run_hydra_head=True
+#     )
+#     model.base_model.model.medusa_mask = medusa_attn_mask
+#     return medusa_logits, logits
+
+def initialize_hydra(input_ids, model, hydra_attn_mask, past_key_values, proposal_cross_attn_masks):
+    """
+    Initializes the Hydra structure for a given model.
+
+    This function performs the following operations:
+    1. Forward pass through the model to obtain the Hydra logits, original model outputs, and logits.
+    2. Sets the Hydra attention mask within the base model.
+
+    Args:
+    - input_ids (torch.Tensor): The input tensor containing token ids.
+    - model (HydraLMHead): The model containing the Hydra layers and base model.
+    - hydra_attn_mask (torch.Tensor): The attention mask designed specifically for the Hydra structure.
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+
+    Returns:
+    - hydra_logits (torch.Tensor): Logits from the Hydra heads.
+    - logits (torch.Tensor): Original logits from the base model.
+    """
+    # _, outputs, logits, _ 
+    
+    medusa_logits, hidden_states, outputs, logits, base_hidden_states = model(
+        input_ids, past_key_values=past_key_values, output_orig=True, medusa_forward=True, run_hydra_head=True
+    )
+    if model.hidden_state_offset == 0:
+        hidden_states = outputs[0].clone()
+    else:
+        hidden_states = outputs[1][-(model.hidden_state_offset + 1)].clone()
+    model.base_model.model.hydra_mask = hydra_attn_mask
+    if model.hydra_head_arch == "cross-attn":
+        model.hydra_head.proposal_hydra_masks = proposal_cross_attn_masks
+    return hidden_states, logits
 
 def reset_medusa_mode(
     model,
@@ -347,6 +404,63 @@ def tree_decoding(
     medusa_logits = tree_medusa_logits[:, 0, retrieve_indices]
     return medusa_logits, logits, outputs
 
+def tree_decoding_hydra(
+    model,
+    tree_candidates,
+    past_key_values,
+    medusa_position_ids,
+    input_ids,
+    retrieve_indices,
+):
+    """
+    Decode the tree candidates using the provided model and reorganize the logits.
+    
+    Parameters:
+    - model (nn.Module): Model to be used for decoding the tree candidates.
+    - tree_candidates (torch.Tensor): Input candidates based on a tree structure.
+    - past_key_values (torch.Tensor): Past states, such as key and value pairs, used in attention layers.
+    - medusa_position_ids (torch.Tensor): Positional IDs associated with the Medusa structure.
+    - input_ids (torch.Tensor): Input sequence IDs.
+    - retrieve_indices (list or torch.Tensor): Indices for reordering the logits.
+    
+    Returns:
+    - tuple: Returns medusa logits, regular logits, and other outputs from the model.
+    """
+
+    # Compute new position IDs by adding the Medusa position IDs to the length of the input sequence.
+    position_ids = medusa_position_ids + input_ids.shape[1]
+
+    
+
+    # Use the model to decode the tree candidates. 
+    # The model is expected to return logits for the Medusa structure, original logits, and possibly other outputs.
+    tree_medusa_logits, hidden_states, outputs, tree_logits, base_hidden_states = model(
+        tree_candidates,
+        # input_ids=input_ids,
+        output_orig=True,
+        run_hydra_head=True,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        medusa_forward=True,
+    )
+
+    if model.hidden_state_offset == 0:
+        hidden_states = outputs[0].clone()
+    else:
+        hidden_states = outputs[1][-(model.hidden_state_offset + 1)].clone()
+    print(f"hidden states {hidden_states}")
+    print(tree_logits.shape)
+    
+    # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.
+    logits = tree_logits[0, retrieve_indices]
+    print("logit shape")
+    print(logits.shape)
+    print("hidden states shape")
+    print(hidden_states.shape)
+    hidden_states = hidden_states[0, retrieve_indices]
+    medusa_logits = tree_medusa_logits[:, 0, retrieve_indices]
+    return hidden_states, medusa_logits
+
 def get_nucleus_posterior_mask(logits, candidates, temperature, top_p):
     """
     Generates a posterior mask for token candidates using nucleus (top-p) sampling.
@@ -458,9 +572,19 @@ def evaluate_posterior(
     # Greedy decoding based on temperature value
     if temperature == 0:
         # Find the tokens that match the maximum logits for each position in the sequence
+        # print(logits.shape)
+        # print(candidates.shape)
+        
+        # print(torch.any(torch.isnan(logits)))
+        
+        # this is failing
+        # var = torch.argmax(logits, dim=-1)
+        # var = var[:,:-1]
+        # print(var)
         posterior_mask = (
             candidates[:, 1:] == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
+        # print(f"posterior mask\n{posterior_mask}")
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
         # Choose the best candidate
@@ -528,6 +652,10 @@ def evaluate_posterior(
         return best_candidate, accept_length
     else:
         raise NotImplementedError
+
+
+
+
 def update_inference_inputs(
     input_ids,
     candidates,
@@ -591,3 +719,235 @@ def update_inference_inputs(
     new_token += accept_length + 1
 
     return input_ids, logits, medusa_logits, new_token
+
+def generate_hydra_buffers(hydra_choices, device="cuda"):
+    """
+    Generate buffers for the Hydra structure based on the provided choices.
+    
+    Parameters:
+    - hydra_choices (list): A nested list representing tree in the Hydra structure.
+    - device (str): Device to which the tensors should be moved. Default is "cuda".
+    
+    Returns:
+    - dict: A dictionary containing buffers related to the Hydra structure.
+    """
+
+    # Sort the hydra_choices based on their lengths and then their values
+    sorted_hydra_choices = sorted(hydra_choices, key=lambda x: (len(x), x))
+    hydra_len = len(sorted_hydra_choices) + 1
+
+    # Initialize depth_counts to keep track of how many choices have a particular depth
+    depth_counts = []
+    prev_depth = 0
+    for path in sorted_hydra_choices:
+        depth = len(path)
+        if depth != prev_depth:
+            depth_counts.append(0)
+        depth_counts[depth - 1] += 1
+        prev_depth = depth
+    
+    # Create the attention mask for Hydra
+    hydra_attn_mask = torch.eye(hydra_len, hydra_len)
+    hydra_attn_mask[:, 0] = 1
+    start = 0
+    for i in range(len(depth_counts)):
+        for j in range(depth_counts[i]):
+            cur_hydra_choice = sorted_hydra_choices[start + j]
+            # retrieve ancestor position
+            if len(cur_hydra_choice) == 1:
+                continue
+            ancestor_idx = []
+            for c in range(len(cur_hydra_choice) - 1):
+                ancestor_idx.append(sorted_hydra_choices.index(cur_hydra_choice[:c+1]) + 1)
+            hydra_attn_mask[j + start + 1, ancestor_idx] = 1
+        start += depth_counts[i]
+
+    # Generate tree indices for the Hydra structure
+    hydra_tree_indices = torch.zeros(hydra_len, dtype=torch.long)
+    hydra_tree_indices[0] = 0
+    start = 0
+    for i in range(len(depth_counts)):
+        for j in range(depth_counts[i]):
+            cur_hydra_choice = sorted_hydra_choices[start + j]
+            hydra_tree_indices[start + j + 1] = cur_hydra_choice[-1] + TOPK * i + 1
+        start += depth_counts[i]
+
+    # Generate position IDs for the Hydra structure
+    hydra_position_ids = torch.zeros(hydra_len, dtype=torch.long)
+    start = 0
+    for i in range(len(depth_counts)):
+        hydra_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
+        start += depth_counts[i]
+
+    # Generate retrieval indices for Hydra structure verification
+    retrieve_indices_nest = []
+    retrieve_paths = []
+    for i in range(len(sorted_hydra_choices)):
+        cur_hydra_choice = sorted_hydra_choices[-i-1]
+        retrieve_indice = []
+        if cur_hydra_choice in retrieve_paths:
+            continue
+        else:
+            for c in range(len(cur_hydra_choice)):
+                retrieve_indice.append(sorted_hydra_choices.index(cur_hydra_choice[:c+1]))
+                retrieve_paths.append(cur_hydra_choice[:c+1])
+        retrieve_indices_nest.append(retrieve_indice)
+    max_length = max([len(x) for x in retrieve_indices_nest])
+    retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
+    retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
+    retrieve_indices = retrieve_indices + 1
+    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1)
+
+    # Compute the max number of tokens a path can accept
+    max_accepts = torch.sum(retrieve_indices > 0, dim=1)
+
+    # Generate the num children per path
+    # Make the assumption that we wouldn't expand a less likely child node if share same parent
+    children_per_head = []
+    num_heads = max([len(path) for path in hydra_choices])
+    for head in range(1, num_heads + 1):
+        head_paths = sorted([path for path in hydra_choices if len(path) == head])
+        prefixes = sorted(list(set([tuple(head_path[:-1]) for head_path in head_paths])))
+        if head == 1:
+            children_per_head.append([len(head_paths)])
+        else:
+            children_per_prefix = [0 for _ in prefixes]
+            for head_path in head_paths:
+                prefix = tuple(head_path[:-1])
+                children_per_prefix[prefixes.index(prefix)] += 1
+            children_per_head.append(children_per_prefix)
+    
+    parents = set()
+    nodes = set()
+    for path in hydra_choices:
+        parents.add(tuple(path[:-1]))
+        nodes.add(tuple(path))
+    parents_per_head = []
+    for head in range(num_heads):
+        parents_per_head.append(sorted([parent for parent in parents if len(parent) == head]))
+
+    def descendant_exists(ancestor, edges_away):
+        suff_depth_away = [path for path in nodes if len(path) >= len(ancestor) + edges_away]
+        for cand in suff_depth_away:
+            if tuple(cand[:len(ancestor)]) == ancestor:
+                return True
+        return False
+
+    # Computing number of children that also have children
+    children_to_expand_per_head = []
+    for head_idx, (parents_at_head, head_children) in enumerate(zip(parents_per_head, children_per_head)):
+        head_children_to_expand = []
+        for parent, parent_num_children in zip(parents_at_head, head_children):
+            parent_num_expand = 0
+            for child_idx in range(parent_num_children):
+                child_path = parent + (child_idx,)
+                if descendant_exists(child_path, 1): parent_num_expand += 1
+            head_children_to_expand.append(parent_num_expand)
+        children_to_expand_per_head.append(head_children_to_expand)
+    
+    # Build the masks for the cross attention hydra head
+    # TODO (ZACK): Considerations if no nodes w/ children
+    sorted_hydra_choices_with_children = [
+        hydra_choice for hydra_choice in sorted_hydra_choices if descendant_exists(tuple(hydra_choice), edges_away=1)
+    ]
+    sorted_hydra_choices_with_children_per_head = defaultdict(list)
+    for hydra_choice_with_children in sorted_hydra_choices_with_children:
+        sorted_hydra_choices_with_children_per_head[
+            len(hydra_choice_with_children)].append(hydra_choice_with_children)
+    sorted_hydra_choices_with_grandchildren = [
+        hydra_choice for hydra_choice in sorted_hydra_choices if descendant_exists(tuple(hydra_choice), edges_away=2)
+    ]
+    sorted_hydra_choices_with_grandchildren_per_head = defaultdict(list)
+    for hydra_choice_with_grandchildren in sorted_hydra_choices_with_grandchildren:
+        sorted_hydra_choices_with_grandchildren_per_head[
+            len(hydra_choice_with_grandchildren)].append(hydra_choice_with_grandchildren)
+
+    # Always have at least one element
+    proposal_cross_attn_masks_per_head = [torch.tensor([[1]])]
+    if sorted_hydra_choices_with_children:
+        for head_idx in range(max(sorted_hydra_choices_with_children_per_head.keys())):
+            head_choices_with_children = sorted_hydra_choices_with_children_per_head[head_idx + 1]
+            ancestor_choices = [choice for h, choices in sorted_hydra_choices_with_grandchildren_per_head.items() for choice in choices if h < head_idx + 1]
+            proposal_cross_attn_mask = torch.zeros(len(head_choices_with_children), len(ancestor_choices) + 1)
+            proposal_cross_attn_mask[:, 0] = 1
+            for choice_idx, head_choice_with_children in enumerate(head_choices_with_children):
+                for ancestor_idx, ancestor_choice in enumerate(ancestor_choices):
+                    if head_choice_with_children[:len(ancestor_choice)] == ancestor_choice:
+                        proposal_cross_attn_mask[choice_idx, ancestor_idx + 1] = 1
+            proposal_cross_attn_masks_per_head.append(proposal_cross_attn_mask.unsqueeze(0).unsqueeze(0))
+
+    # Get the beam size for each head
+    beam_sizes = []
+    num_heads = len(max(hydra_choices, key=len))
+    for head_idx in range(1, num_heads + 1):
+        head_choices = [choice for choice in hydra_choices if len(choice) == head_idx]
+        head_all_k = [hc[head_idx - 1] for hc in head_choices]
+        beam_sizes.append(max(head_all_k) + 1)
+
+    # Aggregate the generated buffers into a dictionary
+    hydra_buffers = {
+        "hydra_attn_mask": hydra_attn_mask.unsqueeze(0).unsqueeze(0),
+        "tree_indices": hydra_tree_indices,
+        "hydra_position_ids": hydra_position_ids,
+        "retrieve_indices": retrieve_indices,
+        "max_accepts": max_accepts,
+        "beam_sizes": beam_sizes
+        }
+    
+    # Move the tensors in the dictionary to the specified device
+    hydra_buffers = {
+        k: v.clone().to(device)
+        if isinstance(v, torch.Tensor)
+        else torch.tensor(v,  device=device)
+        for k, v in hydra_buffers.items()
+    }
+    hydra_buffers["proposal_cross_attn_masks"] = [
+        proposal_cross_attn_mask.clone().to(device) for proposal_cross_attn_mask in proposal_cross_attn_masks_per_head
+    ]
+    hydra_buffers["children_per_head"] = children_per_head
+    hydra_buffers["children_to_expand_per_head"] = children_to_expand_per_head
+
+    return hydra_buffers
+
+def reset_hydra_mode(
+    model,
+):
+    """
+    Resets the Hydra settings and the past key-values to their initial state.
+
+    This function ensures that after any operations involving Hydra,
+    the base model and its settings return to their default state.
+    Specifically, it performs the following tasks:
+    1. Clears the Hydra attention mask in the base model.
+    2. Resets the Hydra mode in the base model.
+    3. Resets the current lengths in the past key-values to zero for all layers.
+
+    Args:
+    - model (HydraLMHead): The model containing the Hydra layers and base model.
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+
+    Returns:
+    - past_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
+    """
+    model.base_model.model.hydra_mask = None
+    model.base_model.model.hydra_mode = None
+
+
+def reset_past_key_values(passed_key_values):
+    """
+    Resets the current lengths in the passed key-values to zero.
+
+    This function is designed to be used during the evaluation of a baseline model.
+    It iterates through each layer's key-values and sets their current lengths to zero,
+    effectively resetting their state.
+
+    Args:
+    - passed_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
+
+    Returns:
+    - passed_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
+    """
+    for i in range(len(passed_key_values)):
+        for j in range(2):
+            passed_key_values[i][j].current_length.fill_(0)
+    return passed_key_values
