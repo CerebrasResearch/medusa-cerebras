@@ -149,46 +149,13 @@ def medusa_forward(input_ids,
 
     return input_ids, new_token, idx, wall_times
 
-def get_correct_tokens(ground_truth_seq, speculative_seqs, n_matches, starting_idx=0):
-    
-    ground_truth_seq = np.squeeze(ground_truth_seq)
-
-    if speculative_seqs[0].shape != speculative_seqs[-1].shape:
-       speculative_seqs = speculative_seqs[:-1]
-       n_matches = n_matches[:-1]
-
-    speculative_seqs = np.squeeze(speculative_seqs)
-    
-
-    idx = starting_idx
-    n_correct = 0
-    n_total = 0
-    for i in range(len(n_matches)):
-        
-        # print(ground_truth_seq[idx:idx+len(speculative_seqs[i])].numpy())
-        # print(speculative_seqs[i])
-        # print(np.where(ground_truth_seq[idx:idx+len(speculative_seqs[i])].numpy() == speculative_seqs[i], 1, 0))
-        ground_truth = ground_truth_seq[idx:idx+len(speculative_seqs[i])].numpy()
-        speculative = speculative_seqs[i]
-        if len(ground_truth) == len(speculative):
-            correct = np.where(ground_truth == speculative, 1, 0).sum()
-        else:
-            n = np.min([len(ground_truth), len(speculative)])
-            correct = np.where(ground_truth[:n] == speculative[:n], 1, 0).sum()
-        
-        # print(correct)
-        n_correct += correct
-        idx += n_matches[i] + 1
-        n_total += len(speculative_seqs[i])
-
-    return n_correct / n_total
 
 if __name__ == "__main__":
     NUM_MEDUSA_HEADS = 2
 
-    main_path = "/cb/home/andrewz/ws/cerebras-research/axolotl/experiments/configs/68m-llama-2-head-decay-0_6-stage2"
+    main_path = "/cb/home/andrewz/ws/cerebras-research/axolotl/experiments/configs/68m-llama-5-head-stage2"
 
-    model_paths = [ main_path + f"/checkpoint-{checkpoint_n*1000}" for checkpoint_n in range(1,14)]
+    model_paths = [ main_path + f"/checkpoint-{checkpoint_n*1000}" for checkpoint_n in range(1,7)]
     # model_paths = [main_path]
 
     prompts = [
@@ -208,17 +175,16 @@ if __name__ == "__main__":
             # low_cpu_mem_usage=True,
             device_map="auto"
         )
-        print(model)
         model.to('cuda')
         tokenizer = model.get_tokenizer()
 
         medusa_choices = mc_sim_7b_63
 
-        temperature = 0.
+        temperature = 0
         posterior_threshold = 0.09
         posterior_alpha = 0.3
 
-        filename = f'2heads-0.6-stage2.csv'
+        filename = f'medusa_out.csv'
         with open(filename, 'a') as csvfile:
             # Create a csv writer object
             csvwriter = csv.writer(csvfile)
@@ -252,14 +218,10 @@ if __name__ == "__main__":
                     print("Output length:", output_ids.size(-1))
 
                     n_matches = aux_metrics["n_matches"]
-                    
                     acceptance = np.sum(n_matches) / len(n_matches) 
-                    # correct_rate_gt = get_correct_tokens(torch.Tensor.cpu(output_ids), aux_metrics["candidate_tokens"], aux_metrics["n_matches"], 0)
 
                     print(f"avg. token acceptance: {acceptance}")
-                    # print(f'correct_rate (GT): {correct_rate_gt}')
-                    
-                    # print("Compression ratio:", new_token / idx)
+
             
                     row = [model_path, prompt, acceptance]
                     csvwriter.writerow(tuple(row))
