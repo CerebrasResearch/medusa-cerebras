@@ -151,7 +151,7 @@ def medusa_forward(input_ids,
 
 
 if __name__ == "__main__":
-    NUM_MEDUSA_HEADS = 2
+    NUM_MEDUSA_HEADS = 5
 
     main_path = "/cb/home/andrewz/ws/cerebras-research/axolotl/experiments/configs/68m-llama-5-head-stage2"
 
